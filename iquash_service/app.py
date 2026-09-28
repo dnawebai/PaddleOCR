@@ -10,14 +10,14 @@ from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel
-from paddleocr import PPStructureV3
+from paddleocr import PaddleOCR
 
 MAX_UPLOAD_BYTES = int(os.getenv("IQUASH_OCR_MAX_UPLOAD_BYTES", str(30 * 1024 * 1024)))
 API_KEY_SHA256 = os.getenv("IQUASH_OCR_API_KEY_SHA256", "").strip().lower()
 
 app = FastAPI(title="iQuash PaddleOCR Service", version="1.0.0", docs_url=None, redoc_url=None)
 
-_pipeline: PPStructureV3 | None = None
+_pipeline: PaddleOCR | None = None
 _pipeline_init_lock = Lock()
 _inference_lock = asyncio.Lock()
 
@@ -47,20 +47,20 @@ def require_api_key(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def get_pipeline() -> PPStructureV3:
+def get_pipeline() -> PaddleOCR:
     global _pipeline
     if _pipeline is None:
         with _pipeline_init_lock:
             if _pipeline is None:
-                _pipeline = PPStructureV3(
-                    use_doc_orientation_classify=True,
-                    use_doc_unwarping=True,
-                    use_textline_orientation=True,
-                    use_seal_recognition=True,
-                    use_table_recognition=True,
-                    use_formula_recognition=False,
-                    use_chart_recognition=False,
-                    use_region_detection=True,
+                _pipeline = PaddleOCR(
+                    text_detection_model_name="PP-OCRv6_tiny_det",
+                    text_recognition_model_name="PP-OCRv6_tiny_rec",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_limit_side_len=1280,
+                    text_det_limit_type="max",
+                    text_recognition_batch_size=16,
                     engine="paddle",
                 )
     return _pipeline
@@ -94,6 +94,11 @@ def _payload(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _page_text(payload: dict[str, Any]) -> str:
+    texts = payload.get("rec_texts")
+    if isinstance(texts, list):
+        cleaned = [str(item).strip() for item in texts if str(item).strip()]
+        if cleaned:
+            return "\n".join(cleaned)
     overall = payload.get("overall_ocr_res")
     if isinstance(overall, dict):
         texts = overall.get("rec_texts")
@@ -109,25 +114,11 @@ def _page_text(payload: dict[str, Any]) -> str:
 
 
 def _page_markdown(payload: dict[str, Any]) -> str | None:
-    for key in ("markdown_text", "markdown", "content"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
     return None
 
 
 def _layout_labels(payload: dict[str, Any]) -> list[str]:
-    layout = payload.get("layout_det_res")
-    boxes = layout.get("boxes") if isinstance(layout, dict) else None
-    if not isinstance(boxes, list):
-        return []
-    labels: list[str] = []
-    for box in boxes:
-        if isinstance(box, dict):
-            label = box.get("label")
-            if isinstance(label, str) and label not in labels:
-                labels.append(label)
-    return labels[:50]
+    return []
 
 
 def _run_pipeline(path: str, include_raw: bool) -> list[PageResult]:
@@ -153,12 +144,19 @@ def _run_pipeline(path: str, include_raw: bool) -> list[PageResult]:
     return pages
 
 
+@app.on_event("startup")
+def warm_pipeline() -> None:
+    # Load the tiny OCR models before the service is marked ready so the first
+    # legal-document scan does not pay model download/initialization latency.
+    get_pipeline()
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
         "ok": True,
         "service": "iquash-paddleocr",
-        "engine": "PP-StructureV3",
+        "engine": "PaddleOCR PP-OCRv6 tiny",
         "model_loaded": _pipeline is not None,
         "auth_configured": bool(API_KEY_SHA256),
     }
@@ -189,7 +187,7 @@ async def parse_document(file: UploadFile = File(...), include_raw: bool = False
         if not pages:
             raise HTTPException(status_code=422, detail="No document pages could be parsed")
         return ParseResponse(
-            engine="PaddleOCR PP-StructureV3",
+            engine="PaddleOCR PP-OCRv6 tiny",
             document_type="pdf" if is_pdf else "image",
             page_count=len(pages),
             pages=pages,
