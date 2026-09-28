@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import hashlib
+import hmac
 import tempfile
 from pathlib import Path
 from threading import Lock
@@ -11,7 +13,7 @@ from pydantic import BaseModel
 from paddleocr import PPStructureV3
 
 MAX_UPLOAD_BYTES = int(os.getenv("IQUASH_OCR_MAX_UPLOAD_BYTES", str(30 * 1024 * 1024)))
-API_KEY = os.getenv("IQUASH_OCR_API_KEY", "").strip()
+API_KEY_SHA256 = os.getenv("IQUASH_OCR_API_KEY_SHA256", "").strip().lower()
 
 app = FastAPI(title="iQuash PaddleOCR Service", version="1.0.0", docs_url=None, redoc_url=None)
 
@@ -36,9 +38,12 @@ class ParseResponse(BaseModel):
 
 
 def require_api_key(authorization: str | None = Header(default=None)) -> None:
-    if not API_KEY:
-        raise HTTPException(status_code=503, detail="OCR service API key is not configured")
-    if authorization != f"Bearer {API_KEY}":
+    if not API_KEY_SHA256:
+        raise HTTPException(status_code=503, detail="OCR service API key hash is not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    digest = hashlib.sha256(authorization[7:].encode()).hexdigest()
+    if not hmac.compare_digest(digest, API_KEY_SHA256):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -155,7 +160,7 @@ def health() -> dict[str, Any]:
         "service": "iquash-paddleocr",
         "engine": "PP-StructureV3",
         "model_loaded": _pipeline is not None,
-        "auth_configured": bool(API_KEY),
+        "auth_configured": bool(API_KEY_SHA256),
     }
 
 
