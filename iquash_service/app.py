@@ -144,6 +144,13 @@ def _run_pipeline(path: str, include_raw: bool) -> list[PageResult]:
     return pages
 
 
+@app.on_event("startup")
+def warm_pipeline() -> None:
+    # Load the tiny OCR models before the service is marked ready so the first
+    # legal-document scan does not pay model download/initialization latency.
+    get_pipeline()
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
